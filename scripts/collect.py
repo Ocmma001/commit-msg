@@ -1,10 +1,9 @@
 #!/usr/bin/env python3
-"""采集 commit 事实包：git 侧改动 + 对话侧上下文。
+"""采集 commit 的 Git 证据；当前对话上下文由 Codex 直接提供。
 
-三个子命令：
+两个子命令：
     overview            改动概览（供选文件用）
     facts    <path>...  选中文件的事实包（供分析用）
-    chat     <path>...  相关对话片段（供分析用）
 """
 from __future__ import annotations
 
@@ -13,13 +12,7 @@ import difflib
 import json
 import subprocess
 import sys
-import time
-from datetime import datetime, timedelta, timezone
 from pathlib import Path
-
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-
-import transcripts  # noqa: E402
 
 # 命中即警告的敏感文件。理由：一旦提交，密钥就进入 git 历史，
 # 即使下个提交删掉也仍保留，push 出去等同于泄露。
@@ -46,7 +39,6 @@ MAX_FILE_BYTES = 5 * 1024 * 1024
 # 200KB ≈ 5 万 token：够装下正常源码文件的两份全文，又不至于让人肉疼。
 MAX_FACTS_BYTES = 200_000
 MAX_TOTAL_FACTS_BYTES = 200_000
-MAX_TOTAL_CHAT_BYTES = 40_000
 CONFLICT_STATES = {"DD", "AU", "UD", "UA", "DU", "AA", "UU"}
 
 
@@ -83,27 +75,6 @@ def _bounded_output(text: str, max_bytes: int) -> str:
     if len(suffix) >= max_bytes:
         return suffix[:max_bytes].decode("utf-8", errors="ignore")
     return payload[:max_bytes - len(suffix)].decode("utf-8", errors="ignore") + notice
-
-
-def _bounded_chat_output(lines: list[str], max_bytes: int) -> str:
-    rendered = "\n\n".join(lines)
-    if len(rendered.encode("utf-8")) <= max_bytes:
-        return rendered
-    notice = _truncation_notice(max_bytes)
-    room = max_bytes - len(notice.encode("utf-8"))
-    if room <= 0:
-        return _bounded_output(rendered, max_bytes)
-    selected = []
-    for line in reversed(lines):
-        payload = line.encode("utf-8")
-        needed = len(payload) + (2 if selected else 0)
-        if needed > room:
-            if not selected:
-                selected.append(payload[:room].decode("utf-8", errors="ignore"))
-            break
-        selected.append(line)
-        room -= needed
-    return "\n\n".join(reversed(selected)) + notice
 
 
 def run_git(args, cwd=None):
@@ -524,92 +495,8 @@ def facts(repo: Path, paths, max_lines: int = 400, context: int = 10,
     return _bounded_output("\n\n".join(chunks), max_total_bytes)
 
 
-def chat(
-    cwd: str,
-    paths,
-    projects_root: Path,
-    anchor,
-    include_current: bool = False,
-    window_hours: int = 6,
-    max_sessions: int = 3,
-    limit: int = 40,
-    source=None,
-    max_total_bytes: int = MAX_TOTAL_CHAT_BYTES,
-) -> str:
-    """检索与本次提交相关的对话片段。
-
-    默认走 ClaudeCodeSource（本机 ~/.claude/projects 下的 JSONL），默认跳过
-    mtime 最新的 transcript —— 那是正在写入的当前会话，模型上下文里已经有了。
-    但上下文被压缩后模型会「忘记」，此时必须用 include_current=True 强制纳入，
-    否则会误判成「对话里没有相关信息」。
-
-    source 可换成任何满足 transcripts.ConversationSource 的对象（签名：
-    search(project_path, keywords, anchor_time, window, limit) -> list[Message]）。
-    include_current / max_sessions / projects_root 只有默认实现用得上，传了
-    自定义 source 时它们不参与检索。
-    """
-    if max_total_bytes <= 0 or limit < 0 or window_hours < 0:
-        raise ValueError("输出字节上限必须大于 0，条数和时间窗口不能为负数")
-    if not isinstance(anchor, datetime) or anchor.utcoffset() is None:
-        raise ValueError("对话检索锚点必须包含时区")
-    if limit == 0:
-        return ""
-    if source is None:
-        source = transcripts.ClaudeCodeSource(
-            Path(projects_root),
-            exclude_current=not include_current,
-            max_sessions=max_sessions,
-        )
-
-    keywords = []
-    for p in paths:
-        norm = str(p).replace("\\", "/")
-        keywords.append(norm)
-        keywords.append(Path(norm).name)
-
-    picked = list(source.search(
-        project_path=cwd,
-        keywords=keywords,
-        anchor_time=anchor,
-        window=timedelta(hours=window_hours),
-        limit=limit,
-    ))
-    # 契约允许 timestamp 为 None（缺字段或解析失败），而下面的排序和渲染
-    # 都不接受 None。默认实现在 select_relevant 里已经滤过，但第三方 source
-    # 未必 —— 这里兜住，否则一个 None 就让整个命令 TypeError 硬失败。
-    picked = [dict(m, timestamp=m["timestamp"].astimezone(timezone.utc)) for m in picked
-              if isinstance(m.get("timestamp"), datetime) and m["timestamp"].utcoffset() is not None]
-    # 空结果不再分三种说法：契约上「没找到目录」「没有记录文件」「关键词没命中」
-    # 都只是 []，调用方无从区分（也不该区分 —— 那三种说法只有 Claude Code 实现
-    # 才有意义）。合成一条，但仍要把可操作的两条出路说全。
-    if not picked:
-        return _bounded_output(
-            "（没有找到可用的对话记录，请仅依据代码改动撰写。"
-            "若确认讨论过，默认实现可加 --include-current 重试 —— "
-            "它默认跳过修改时间最新的记录文件。）", max_total_bytes,
-        )
-
-    picked.sort(key=lambda m: m["timestamp"])
-    # 跨会话合并后的总量在这里统一裁，输出有界不依赖 source 是否守规矩
-    picked = picked[-limit:] if limit > 0 else []
-    lines = []
-    for m in picked:
-        # 用「助手」而不是「Claude」：source 可以是任何客户端，把别家的
-        # 助手发言标成 Claude 就是又一处写死。role 已经区分了人机。
-        who = "用户" if m["role"] == "user" else "助手"
-        stamp = m["timestamp"].strftime("%m-%d %H:%M")
-        lines.append(f"[{stamp}] {who}：{m['text']}")
-    return _bounded_chat_output(lines, max_total_bytes)
-
-
-def _default_projects_root() -> Path:
-    return Path.home() / ".claude" / "projects"
-
-
 def main(argv=None) -> int:
-    # 输出强制 UTF-8。本机 sys.stdout.encoding 是 gbk，而消费方（Claude Code
-    # 读工具输出）按 UTF-8 解码 —— 不强制的话中文路径全变乱码；U+2212 更是
-    # 不在 GBK 里，会让任何一次 facts 调用直接抛 UnicodeEncodeError。
+    # 输出强制 UTF-8，避免中文路径或 U+2212 等字符在不同终端之间产生乱码。
     # backslashreplace 兜底：将来出现别的不可编码字符时降级显示，而不是崩。
     for stream in (sys.stdout, sys.stderr):
         try:
@@ -632,54 +519,19 @@ def main(argv=None) -> int:
                          help="证据版本：index 为暂存区，worktree 为整个文件工作区版本")
     p_facts.add_argument("--max-total-bytes", type=int, default=MAX_TOTAL_FACTS_BYTES)
 
-    p_chat = sub.add_parser("chat", help="相关对话片段")
-    p_chat.add_argument("paths", nargs="+")
-    p_chat.add_argument("--include-current", action="store_true",
-                        help="上下文被压缩时使用：强制纳入当前 session")
-    p_chat.add_argument("--window-hours", type=int, default=6)
-    p_chat.add_argument("--limit", type=int, default=40)
-    p_chat.add_argument("--max-total-bytes", type=int, default=MAX_TOTAL_CHAT_BYTES)
-
     args = parser.parse_args(argv)
     repo = Path(args.repo).resolve()
     try:
         if args.cmd == "overview":
             print(json.dumps(overview(repo), ensure_ascii=False, indent=2))
-        elif args.cmd == "facts":
+        else:
             print(facts(repo, args.paths, max_lines=args.max_lines,
                         context=args.context, max_bytes=args.max_bytes,
                         source=args.source, max_total_bytes=args.max_total_bytes), end="")
-        else:
-            anchor = _newest_mtime(repo, args.paths)
-            print(chat(
-                cwd=str(repo),
-                paths=args.paths,
-                projects_root=_default_projects_root(),
-                anchor=anchor,
-                include_current=args.include_current,
-                window_hours=args.window_hours,
-                limit=args.limit,
-                max_total_bytes=args.max_total_bytes,
-            ), end="")
     except (GitError, OSError, ValueError) as exc:
         print(f"错误：{exc}", file=sys.stderr)
         return 1
     return 0
-
-
-def _newest_mtime(repo: Path, paths):
-    """以选中文件里最新的修改时间作为对话检索的时间锚点。"""
-    newest = 0.0
-    for p in paths:
-        full = repo / str(p).replace("\\", "/")
-        try:
-            newest = max(newest, full.stat().st_mtime)
-        except OSError:
-            continue
-    if newest == 0.0:
-        # 选中的文件全都不在磁盘上（例如删除的文件），退回当前时间。
-        newest = time.time()
-    return datetime.fromtimestamp(newest, tz=timezone.utc)
 
 
 if __name__ == "__main__":
